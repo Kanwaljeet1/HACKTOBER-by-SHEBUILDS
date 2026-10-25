@@ -161,12 +161,6 @@ Backend rules and phase scope: [implementation plan](docs/development/backend-pl
 
 ---
 
-## Original README (preserved)
-
-The following content is retained unchanged. Its older deployment and provider
-status notes describe an earlier project state; use the documentation above for
-current deployment status and verification limits.
-
 # JanMaang
 
 A civic demand-to-budget platform. A citizen reports a local need in their own
