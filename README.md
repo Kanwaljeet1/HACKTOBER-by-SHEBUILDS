@@ -2,18 +2,6 @@
 
 ## Project Documentation Template
 
-JanMaang project documentation for the flexible 15-day Hacktober Hack Days roadmap.
-Updated **25 October 2026**. This current overview takes precedence over the historical
-status notes in the original README, which is preserved below.
-
-## How to Use This Template
-
-Maintain Sections 1 to 6 as the project evolves. Keep daily progress and evidence in
-[development documentation](docs/development/), and prepare the demo video, slides,
-and final submission checklist before the deadline. No daily log or submission
-completion is implied by this overview.
-
-## Suggested 15-Day Roadmap
 
 | Phase | Days | Focus |
 |---|---|---|
