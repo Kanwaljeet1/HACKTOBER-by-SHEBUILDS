@@ -23,7 +23,9 @@
 | Live staff dashboard | [Vercel](https://hacktober-by-shebuilds.vercel.app) |
 | Backend health | [Render API health](https://hacktober-api.onrender.com/health) |
 | Demo video link | [Video Demo](https://drive.google.com/file/d/1oX8UWCxqd1B8aBWgczOgVRHUPmciUrOa/view?usp=sharing) |
-| Presentation link | [PPT](https://canva.link/c8753oy5n5khmd8)
+
+
+
 All three applications are deployed. The backend health check, dashboard page and
 citizen app bundle responded successfully; the deployed citizen bundle uses the
 hosted API. A complete report-to-verification journey on the hosted applications
