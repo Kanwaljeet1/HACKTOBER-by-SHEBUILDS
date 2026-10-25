@@ -34,7 +34,7 @@ completion is implied by this overview.
 | Live citizen app | [Firebase Hosting](https://hacktober-by-she-builds.web.app) |
 | Live staff dashboard | [Vercel](https://hacktober-by-shebuilds.vercel.app) |
 | Backend health | [Render API health](https://hacktober-api.onrender.com/health) |
-| Demo video link | Not published. |
+| Demo video link | [Video Demo](https://drive.google.com/file/d/1oX8UWCxqd1B8aBWgczOgVRHUPmciUrOa/view?usp=sharing) |
 | Presentation / slides | Not published. |
 
 All three applications are deployed. The backend health check, dashboard page and
