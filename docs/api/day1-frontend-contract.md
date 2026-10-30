@@ -268,10 +268,11 @@ access. Writes marked † carry an `Idempotency-Key` header.
 | `GET statements?status=` | — | items `{"id","title","body","status":"draft\|published","cluster_id","published_at"}`. **Read access:** student, faculty, institute, industry, gov admin and super admin see **published** statements only; a department sees published statements plus **its own drafts**. Drafts are never visible outside the owning department |
 | `POST statements` † | `{"title","body","cluster_id"?}` | statement — department only, owned by the caller's department |
 | `POST statements/{id}/publish` | — | statement — owning department only; publishing twice returns the published statement |
+| `GET cases?limit=200` | — | items `{"cluster_id","report_code","title","category","status","waiting_on":"department\|officer\|citizen\|none","status_changed_at","work_order_id","round","department_name","officer_name","allocated_paise","allocated_at","allocated_by_name"}`, most recently changed first: every case from `prioritised` to `citizen_verified`. A department sees prioritised cases in categories it answers for in its district, plus cases it funded; a gov admin sees the district; a super admin sees all; other roles 403. Allocation fields are `null` until funded; amounts are recorded allocations, not payments |
 | `GET work-orders?mine=true` | — | items `{"id","cluster_id","report_code","title","status","round","location_label","instructions","notes","allocated_paise","assigned_at"}` |
 | `PATCH work-orders/{id}` | `{"notes":"…"}` | `{"id","status"}`; the first update moves `funded → in_progress` only the assigned officer (404 otherwise); after completion is submitted, 409 |
 | `POST work-orders/{id}/complete` † | `{"media_ids":[…],"expected_round":n}` (the caller's own `completion` media; `n` is the work order's `round` as shown) | `{"id","status":"awaiting_verification"}`. Only from `in_progress`. **409** if `expected_round` is not the current round (the citizen returned the work since the page loaded). The attached media are stored with the work order's **current round**; earlier rounds' photos are kept, never overwritten |
-| `GET work-orders/{id}/evidence` | — | evidence (above), for **every** assigned order, open ones included. `after` is chosen deliberately by round: while `awaiting_verification` or `citizen_verified`, the **current** round's completion; while `in_progress` on round > 1, the **previous** round's (returned) completion, which the officer page labels "Previous completion · returned by the citizen"; otherwise `null`. `after_round` (int or null) states which round `after` belongs to |
+| `GET work-orders/{id}/evidence` | — | evidence (above), for **every** assigned order, open ones included. `after` is chosen deliberately by round: while `awaiting_verification` or `citizen_verified`, the **current** round's completion; while `in_progress` on round > 1, the **previous** round's (returned) completion, which the officer page labels "Previous completion · returned by the citizen"; otherwise `null`. `after_round` (int or null) states which round `after` belongs to. `returned_comment` (string or null): while `in_progress` on round > 1, the citizen's reason for returning the round shown, so the officer knows what to fix |
 
 `round` starts at 1 and increases each time the reporter answers "not fixed".
 
@@ -305,9 +306,9 @@ Scope is the API's: `mine=true` is the caller's own records and
 | `GET sponsorships?mine=true` | — | items `{"id","statement_id","statement_title","amount_paise","status":"pledged","pledged_at"}` |
 | `POST statements/{id}/sponsorships` † | `{"amount_paise"}` | sponsorship |
 | `GET admin/summary` | — | `{"district_name","reports_by_status":{status:count},"cluster_count","work_orders_by_status":{status:count},"allocated_paise","pledged_paise"}` |
-| `GET admin/audit?limit=50` | — | items `{"id","at","actor_name","actor_role","action","entity_type","entity_id","reason"}`, newest first. Each event stores its own `district_id` (the district of the affected record, nullable for platform-wide events); a gov admin sees events for their district, a super admin sees all. Scope never depends on the actor's current organisation |
+| `GET admin/audit?limit=50[&before_at=…&before_id=…]` | — | `{"items":[{"id","at","actor_name","actor_role","action","entity_type","entity_id","reason","before","after"}],"next":{"before_at","before_id"}\|null}`, newest first. Pass `next` back to read older events (keyset paging: no gaps or repeats); both cursor parts or neither (422). `before`/`after` are the recorded field values with contact details (`email`) removed. Each event stores its own `district_id` (the district of the affected record, nullable for platform-wide events); a gov admin sees events for their district, a super admin sees all. Scope never depends on the actor's current organisation |
 | `GET admin/users` | — (super admin) | items `{"id","display_name","email","role","district_id","department_id","institute_id","organization_id"}` |
-| `GET organizations` | — (super admin) | items `{"id","type":"district\|department\|institute\|industry","name"}` |
+| `GET organizations` | — (super admin) | items `{"id","type":"district\|department\|institute\|industry","name","parent_id"}` — `parent_id` is the district a department, institute or industry organization belongs to (`null` for districts) |
 | `PATCH admin/users/{id}` | `{"role","district_id","department_id","institute_id","organization_id"?,"reason"}` — `null` clears a scope | admin user; the audit event is written in the same transaction. **403 when `{id}` is the caller**: nobody changes their own role or scope (the web client also refuses). **409 when the user is an officer with open work orders** (`funded`, `in_progress` or `awaiting_verification`) and the change would remove their access to them |
 
 For administration, `organization_id` is required when assigning the industry
@@ -442,6 +443,28 @@ evidence" and offers Reload; nothing is recorded.
 | 503 | Not configured, timed out (8 s), provider error, or output that fails validation — `{"detail":"Suggestions are unavailable right now. Enter the details yourself."}` |
 
 Nothing is stored and no idempotency key is needed. Failure must leave manual entry and submission available; it must not create or imply a persisted report. Photos are not sent.
+
+## Case-update notifications (Flutter inbox)
+
+| Endpoint | Body | Response / rules |
+|---|---|---|
+| `GET notifications?unread_only=false&limit=50&offset=0` | — | `{"items":[{"id","title","body","resource_type","resource_id","created_at","read_at"}],"unread_count"}`, newest first. Only the signed-in user's own notifications |
+| `POST notifications/{id}/read` | — | `{"id","read_at"}`. Marking twice keeps the first time. Another user's notification is 404 |
+
+Notifications are written in the same transaction as the change they describe, so a failed change never notifies. Reporters (and explicit supporters) of a cluster are told when their report is reviewed or clustered, when the case is funded, when work starts, when completion evidence is ready for review, and when a verdict is recorded. Completion and verdict updates are **per round**, so a correction round notifies again. In-app only: no push, SMS or WhatsApp delivery yet. The citizen app's demo mode shows an explanatory message instead of an inbox.
+
+## Account activation (super admin)
+
+| Endpoint | Body | Response / rules |
+|---|---|---|
+| `PATCH admin/users/{id}/status` | `{"is_active":true\|false,"reason"}` | admin user (now including `is_active`). A deactivated account is refused on its next request. 403 for your own account and for non-super admins; **409** for an officer with open work orders (funded, in progress or awaiting verification); the reason is required and audited as `user.activated` / `user.deactivated`. No staff-site control yet |
+
+## Transparency analytics
+
+| Endpoint | Body | Response / rules |
+|---|---|---|
+| `GET analytics/public` | — (**no sign-in**) | `{"report_count","cluster_count","active_cases","citizen_verified_cases","reports_by_status","clusters_by_status","sample_data","updated_at"}`: aggregate totals only; a complaint takes its case's status, and both totals come from one snapshot. **Live records only once any exist; until then the labelled demonstration data is shown with `sample_data: true`** (the homepage labels it "Sample data"). Sample and live figures are never mixed. No reporter, title, photo or coordinate is published |
+| `GET analytics/workload` | — (department, gov admin, super admin) | Per active, non-demo officer in scope: open, funded, in-progress and awaiting-verification work orders and the oldest open assignment. Other roles 403. Not yet shown in either client |
 
 ## Integration gate
 

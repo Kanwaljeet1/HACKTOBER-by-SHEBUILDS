@@ -1,20 +1,29 @@
 """Scoped aggregate queries and atomic privileged user changes."""
 
+from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, literal, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core.audit import AuditEvent
 from app.core.errors import ConflictError, NotFoundError, PermissionDeniedError, ValidationError
 from app.core.roles import Role
 from app.core.security import Principal
+from app.modules.analytics.schemas import (
+    PublicTransparency,
+    StaffWorkload,
+    StaffWorkloadList,
+)
 from app.modules.audit.models import AuditEventRecord
 from app.modules.audit.schemas import (
     AdminSummary,
     AdminUserChange,
     AdminUserList,
     AdminUserRead,
+    AdminUserStatusChange,
+    AuditCursor,
     AuditList,
     AuditRead,
     OrganizationList,
@@ -31,6 +40,70 @@ from app.shared.enums import ProblemStatus as Status
 
 # Work an officer still has to carry out or see verified.
 OPEN_WORK = (Status.FUNDED, Status.IN_PROGRESS, Status.AWAITING_VERIFICATION)
+
+
+async def _public_totals(session: AsyncSession, *, demo: bool) -> PublicTransparency:
+    """Aggregate either live or demonstration records, never a mixture."""
+    status = func.coalesce(Cluster.status, Report.status).label("status")
+    reports = (
+        select(
+            literal("report").label("kind"),
+            status,
+            func.count().label("total"),
+            func.max(Report.status_changed_at).label("updated_at"),
+        )
+        .select_from(Report)
+        .outerjoin(Cluster, Report.cluster_id == Cluster.id)
+        .where(
+            Report.is_demo.is_(demo),
+            or_(Cluster.id.is_(None), Cluster.is_demo.is_(demo)),
+        )
+        .group_by(status)
+    )
+    cases = (
+        select(
+            literal("case").label("kind"),
+            Cluster.status.label("status"),
+            func.count().label("total"),
+            func.max(Cluster.status_changed_at).label("updated_at"),
+        )
+        .where(Cluster.is_demo.is_(demo))
+        .group_by(Cluster.status)
+    )
+    # One statement gives both aggregates the same READ COMMITTED snapshot.
+    rows = (await session.execute(reports.union_all(cases))).all()
+    report_counts = {row.status: row.total for row in rows if row.kind == "report"}
+    case_counts = {row.status: row.total for row in rows if row.kind == "case"}
+    updates = [row.updated_at for row in rows if row.updated_at is not None]
+    return PublicTransparency(
+        report_count=sum(report_counts.values()),
+        cluster_count=sum(case_counts.values()),
+        active_cases=sum(
+            count
+            for status, count in case_counts.items()
+            if status not in {Status.CITIZEN_VERIFIED, Status.REJECTED}
+        ),
+        citizen_verified_cases=case_counts.get(Status.CITIZEN_VERIFIED, 0),
+        reports_by_status=report_counts,
+        clusters_by_status=case_counts,
+        sample_data=demo,
+        updated_at=max(updates) if updates else None,
+    )
+
+
+async def public_transparency(session: AsyncSession) -> PublicTransparency:
+    """Public aggregate counts; report status follows its community case.
+
+    Live records only once any exist. Before that, the labelled demonstration
+    data is shown with `sample_data` set, so the homepage is never a row of
+    zeros during a demo and sample figures are never presented as real.
+    """
+    live = await _public_totals(session, demo=False)
+    if live.report_count or live.cluster_count:
+        return live
+    sample = await _public_totals(session, demo=True)
+    # With no demonstration data either, the honest answer is zero.
+    return sample if sample.report_count or sample.cluster_count else live
 
 
 def require_admin(principal: Principal, *, super_only: bool = False) -> None:
@@ -90,20 +163,106 @@ async def summary(session: AsyncSession, principal: Principal) -> AdminSummary:
     )
 
 
-async def audit_list(session: AsyncSession, principal: Principal, limit: int) -> AuditList:
+async def staff_workload(
+    session: AsyncSession,
+    principal: Principal,
+) -> StaffWorkloadList:
+    if principal.role not in {Role.DEPARTMENT, Role.GOV_ADMIN, Role.SUPER_ADMIN}:
+        raise PermissionDeniedError("Department or administrator access required.")
+    if principal.role in {Role.DEPARTMENT, Role.GOV_ADMIN} and principal.district_id is None:
+        raise PermissionDeniedError("Your account has no assigned district.")
+    department = aliased(Organization)
+    live_work = WorkOrder.is_demo.is_(False) & Cluster.is_demo.is_(False)
+    funded = func.count(WorkOrder.id).filter(live_work, Cluster.status == Status.FUNDED)
+    in_progress = func.count(WorkOrder.id).filter(live_work, Cluster.status == Status.IN_PROGRESS)
+    awaiting = func.count(WorkOrder.id).filter(
+        live_work, Cluster.status == Status.AWAITING_VERIFICATION
+    )
+    open_count = func.count(WorkOrder.id).filter(live_work, Cluster.status.in_(OPEN_WORK))
+    oldest = func.min(case((live_work & Cluster.status.in_(OPEN_WORK), WorkOrder.assigned_at)))
+    query = (
+        select(
+            User.id,
+            User.display_name,
+            User.email,
+            department.name,
+            open_count,
+            funded,
+            in_progress,
+            awaiting,
+            oldest,
+        )
+        .select_from(User)
+        .outerjoin(WorkOrder, WorkOrder.officer_id == User.id)
+        .outerjoin(Cluster, Cluster.id == WorkOrder.cluster_id)
+        .outerjoin(department, department.id == User.department_id)
+        .where(User.role == Role.OFFICER, User.is_active.is_(True), User.is_demo.is_(False))
+        .group_by(User.id, department.name)
+        .order_by(open_count.desc(), User.display_name, User.id)
+    )
+    if principal.role != Role.SUPER_ADMIN:
+        query = query.where(User.district_id == principal.district_id)
+    if principal.role == Role.DEPARTMENT:
+        if principal.department_id is None:
+            raise PermissionDeniedError("Your account has no assigned department.")
+        query = query.where(User.department_id == principal.department_id)
+    result = await session.execute(query)
+    return StaffWorkloadList(
+        items=[
+            StaffWorkload(
+                user_id=row[0],
+                display_name=row[1],
+                email=row[2],
+                department_name=row[3],
+                open_work_orders=row[4] or 0,
+                funded=row[5] or 0,
+                in_progress=row[6] or 0,
+                awaiting_verification=row[7] or 0,
+                oldest_open_assignment=row[8],
+            )
+            for row in result.all()
+        ]
+    )
+
+
+# Contact details stay out of audit views; the users list is super-admin only.
+PRIVATE_AUDIT_KEYS = frozenset({"email"})
+
+
+def _public(values: dict[str, Any] | None) -> dict[str, Any] | None:
+    if values is None:
+        return None
+    return {key: value for key, value in values.items() if key not in PRIVATE_AUDIT_KEYS}
+
+
+async def audit_list(
+    session: AsyncSession,
+    principal: Principal,
+    limit: int,
+    before: AuditCursor | None = None,
+) -> AuditList:
     require_admin(principal)
     query = select(AuditEventRecord, User.display_name).join(
         User, AuditEventRecord.actor_id == User.id
     )
     if principal.role != Role.SUPER_ADMIN:
         query = query.where(AuditEventRecord.district_id == principal.district_id)
+    if before is not None:
+        # Keyset paging on the same (time, id) order: no gaps or repeats when
+        # new events arrive between pages.
+        query = query.where(
+            tuple_(AuditEventRecord.created_at, AuditEventRecord.id)
+            < tuple_(literal(before.before_at), literal(before.before_id))
+        )
     rows = (
         await session.execute(
             query.order_by(AuditEventRecord.created_at.desc(), AuditEventRecord.id.desc()).limit(
-                limit
+                limit + 1
             )
         )
     ).all()
+    page, more = rows[:limit], len(rows) > limit
+    last = page[-1][0] if page else None
     return AuditList(
         items=[
             AuditRead(
@@ -115,9 +274,12 @@ async def audit_list(session: AsyncSession, principal: Principal, limit: int) ->
                 entity_type=e.entity_type,
                 entity_id=e.entity_id,
                 reason=e.reason,
+                before=_public(e.before),
+                after=_public(e.after),
             )
-            for e, name in rows
-        ]
+            for e, name in page
+        ],
+        next=AuditCursor(before_at=last.created_at, before_id=last.id) if more and last else None,
     )
 
 
@@ -214,4 +376,53 @@ async def change_user(
                     reason=body.reason,
                 ),
             )
+    return after
+
+
+async def change_user_status(
+    session: AsyncSession,
+    principal: Principal,
+    identity: UUID,
+    body: AdminUserStatusChange,
+) -> AdminUserRead:
+    require_admin(principal, super_only=True)
+    if identity == principal.user_id and not body.is_active:
+        raise PermissionDeniedError("Another super administrator must deactivate your account.")
+    user = await session.scalar(
+        select(User)
+        .where(User.id == identity)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if user is None:
+        raise NotFoundError("User not found.")
+    if user.is_active == body.is_active:
+        return AdminUserRead.model_validate(user)
+    if not body.is_active and user.role == Role.OFFICER:
+        open_work = await session.scalar(
+            select(func.count())
+            .select_from(WorkOrder)
+            .join(Cluster, WorkOrder.cluster_id == Cluster.id)
+            .where(WorkOrder.officer_id == identity, Cluster.status.in_(OPEN_WORK))
+        )
+        if open_work:
+            raise ConflictError(
+                "Complete, reassign or verify this officer's open work before deactivation."
+            )
+    before = AdminUserRead.model_validate(user).model_dump(mode="json")
+    user.is_active = body.is_active
+    after = AdminUserRead.model_validate(user)
+    await SqlAuditWriter().log_event(
+        session,
+        AuditEvent(
+            principal.user_id,
+            "user.activated" if body.is_active else "user.deactivated",
+            "user",
+            user.id,
+            user.district_id,
+            before=before,
+            after=after.model_dump(mode="json"),
+            reason=body.reason,
+        ),
+    )
     return after
