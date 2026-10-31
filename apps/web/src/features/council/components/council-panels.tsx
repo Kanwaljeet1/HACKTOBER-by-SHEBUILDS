@@ -21,6 +21,7 @@ import {
   type AssessmentDetail,
   type EvidenceFile,
 } from "../api";
+import { extractPdfText, MAX_PDF_BYTES } from "../pdf-text";
 
 const date = new Intl.DateTimeFormat("en-IN", { dateStyle: "medium" });
 const SOURCE_EXTENSIONS =
@@ -141,6 +142,7 @@ function CouncilRequest({ submissions }: { submissions: Submission[] }) {
   const [files, setFiles] = useState<EvidenceFile[]>([]);
   const [fileError, setFileError] = useState<string | null>(null);
   const [reading, setReading] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const request = useRef({ body: "", key: "" });
 
   async function readFiles(selected: FileList | null) {
@@ -154,7 +156,8 @@ function CouncilRequest({ submissions }: { submissions: Submission[] }) {
       const next: EvidenceFile[] = [];
       for (const file of Array.from(selected)) {
         const extension = "." + file.name.split(".").pop()?.toLowerCase();
-        if (!SOURCE_EXTENSIONS.split(",").includes(extension))
+        const pdf = extension === ".pdf";
+        if (!pdf && !SOURCE_EXTENSIONS.split(",").includes(extension))
           throw new RangeError(`Unsupported evidence file: ${file.name}`);
         if (
           !/^[A-Za-z0-9][A-Za-z0-9_. -]{0,127}$/.test(file.name) ||
@@ -164,11 +167,22 @@ function CouncilRequest({ submissions }: { submissions: Submission[] }) {
           throw new RangeError(
             "Use plain filenames without folders or traversal.",
           );
-        if (file.size > 200000)
+        if (file.size > (pdf ? MAX_PDF_BYTES : 200000))
           throw new RangeError(`File is too large: ${file.name}`);
-        const content = new TextDecoder("utf-8", { fatal: true }).decode(
-          await file.arrayBuffer(),
-        );
+        // A PDF becomes text here; the council only ever receives text.
+        const content = pdf
+          ? await extractPdfText(await file.arrayBuffer()).catch((error) => {
+              throw error instanceof RangeError
+                ? new RangeError(`${file.name}: ${error.message}`)
+                : new RangeError(`Could not read the PDF: ${file.name}`);
+            })
+          : new TextDecoder("utf-8", { fatal: true }).decode(
+              await file.arrayBuffer(),
+            );
+        if (pdf && content.length > 50000)
+          throw new RangeError(
+            `${file.name} has more than 50,000 characters of text. Split it or submit the key sections.`,
+          );
         if (
           !content.trim() ||
           content.length > 50000 ||
@@ -177,7 +191,10 @@ function CouncilRequest({ submissions }: { submissions: Submission[] }) {
           )
         )
           throw new RangeError(`Invalid or oversized text file: ${file.name}`);
-        next.push({ name: file.name, content });
+        next.push({
+          name: pdf ? file.name.replace(/\.pdf$/i, "-pdf.txt") : file.name,
+          content,
+        });
       }
       if (new Set(next.map((f) => f.name.toLowerCase())).size !== next.length)
         throw new RangeError("Evidence filenames must be unique.");
@@ -201,30 +218,66 @@ function CouncilRequest({ submissions }: { submissions: Submission[] }) {
         supervising faculty. The report is advisory and does not change faculty
         grades.
       </p>
-      <label>
-        Supporting text and source files
-        <input
-          aria-label="Council evidence files"
-          type="file"
-          multiple
-          accept={SOURCE_EXTENSIONS}
-          disabled={reading}
-          onChange={(e) => {
-            void readFiles(e.target.files);
-            e.target.value = "";
-          }}
-        />
-      </label>
-      <p className="jm-small">
-        Up to 20 UTF-8 files; 50,000 characters each; 200,000 characters total.
-        Files are read as evidence and never executed.
+      <div
+        className={`jm-dropzone${dragging ? " is-dragging" : ""}`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (!reading) setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          if (!reading) void readFiles(e.dataTransfer.files);
+        }}
+      >
+        <span className="jm-dropzone-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none">
+            <path
+              d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </span>
+        <div className="jm-dropzone-copy">
+          <p className="jm-dropzone-title">
+            Attach your research, findings or code
+          </p>
+          <p className="jm-small">
+            PDF, text, Markdown, CSV or source files. Drag them here or choose
+            files.
+          </p>
+        </div>
+        <label className="jm-button jm-dropzone-button">
+          {reading ? "Reading…" : "Choose files"}
+          <input
+            className="jm-visually-hidden"
+            aria-label="Council evidence files"
+            type="file"
+            multiple
+            accept={`.pdf,${SOURCE_EXTENSIONS}`}
+            disabled={reading}
+            onChange={(e) => {
+              void readFiles(e.target.files);
+              e.target.value = "";
+            }}
+          />
+        </label>
+      </div>
+      <p className="jm-small" role="status">
+        {reading
+          ? "Reading your files. A PDF is converted to text in your browser."
+          : "Up to 20 files, 50,000 characters each. PDFs up to 10 MB and 50 pages are converted to text in your browser; scanned PDFs have no text to read. Files are read as evidence and never executed."}
       </p>
       {fileError && (
         <p className="jm-form-error" role="alert">
           {fileError}
           <button
             type="button"
-            className="jm-button jm-button-secondary"
+            className="jm-button jm-button-secondary jm-button-small"
             onClick={() => setFileError(null)}
           >
             Clear file error
@@ -232,10 +285,16 @@ function CouncilRequest({ submissions }: { submissions: Submission[] }) {
         </p>
       )}
       {files.length > 0 && (
-        <ul>
+        <ul className="jm-file-list" aria-label="Attached evidence">
           {files.map((f) => (
             <li key={f.name}>
-              {f.name}{" "}
+              <span className="jm-badge">
+                {f.name.endsWith("-pdf.txt") ? "PDF → text" : "Text"}
+              </span>
+              <span className="jm-file-name">{f.name}</span>
+              <span className="jm-small">
+                {f.content.length.toLocaleString("en-IN")} characters
+              </span>
               <button
                 type="button"
                 className="jm-button jm-button-secondary jm-button-small"
